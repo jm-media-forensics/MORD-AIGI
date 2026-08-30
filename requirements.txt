@@ -1,0 +1,13 @@
+# Core
+torch>=1.13
+torchvision>=0.14
+numpy
+pillow
+scikit-learn
+tensorboardX
+
+# UnivFD baseline (frozen CLIP ViT-L/14 linear probe)
+ftfy
+regex
+# CLIP weights are downloaded on first run by the vendored loader in
+# UnivFD/UniversalFakeDetect (clone it from the upstream repo, see README).
