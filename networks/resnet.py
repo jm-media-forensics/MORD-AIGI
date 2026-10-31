@@ -161,18 +161,18 @@ class ResNet(nn.Module):
 
     def pid_residual_round(self, img, delta=(1.0, 1.0, 1.0)):
         """
-        仅硬量化(round)的 PID 残差
+        PiD residual with hard (round) quantization in YUV.
         Args:
-            img   : [B,3,H,W]，float；建议像素量纲 0..255（不做归一化）
-            delta : 三通道量化步长 (ΔY, ΔU, ΔV)，可标量或三元组
+            img   : [B,3,H,W], float RGB in [0, 1], no normalization
+            delta : quantization steps (dY, dU, dV), scalar or triple
         Returns:
-            residual: [B,3,H,W]，img - 重建图（浮点残差，量纲与输入一致）
+            residual: [B,3,H,W], img minus its quantized reconstruction
         """
         B, C, H, W = img.shape
-        assert C == 3, "需要 RGB 三通道输入"
+        assert C == 3, "RGB input required"
         device, dtype = img.device, img.dtype
 
-        # YUV 线性变换（无偏置）
+        # linear RGB -> YUV transform (no offset)
         M = torch.tensor([[0.299000, 0.587000, 0.114000],
                           [-0.168736, -0.331264, 0.500000],
                           [0.500000, -0.418688, -0.081312]], device=device, dtype=dtype)
@@ -184,50 +184,50 @@ class ResNet(nn.Module):
         # RGB -> YUV
         YUV = X @ M.T
 
-        # 步长
+        # quantization steps
         if not isinstance(delta, (list, tuple)):
             delta = (float(delta),) * 3
         d = torch.tensor(delta, device=device, dtype=dtype).view(1, 1, 3)
 
-        # 硬量化（取整）
+        # hard quantization
         YUVq = torch.round(YUV / d) * d
 
         # YUV -> RGB
         Xq = YUVq @ Minv.T
         Xq = Xq.reshape(B, H, W, 3).permute(0, 3, 1, 2)
 
-        # 残差
+        # residual
         residual = img - Xq
         return residual
 
     def pca_block_round_residual_fast_accel_1stRGB_2ndPCA(self, img, q=4.0, block=32):
         """
-        保留 PCA 二阶特征（PCA->Z->量化->重建得到 residual/content）
-        一阶特征改为 RGB 像素域 q 量化残差（不再使用 Z-space 一阶）
-    
+        BCPR residual: block-wise PCA of the local color covariance, quantization of the
+        basis and of the coefficients, and reconstruction.
+
         Args:
-            img: [B,3,H,W], 像素范围 [0,255]
-            q:   像素域量化步长（同样用于 Z-space 量化；如果你想二者分开见下方备注）
-            block: 分块大小
-    
+            img:   [B,3,H,W], RGB in [0, 1]
+            q:     coefficient quantization step
+            block: block size k
+
         Returns:
-            residual_pca: [B,3,H,W]  # 二阶（PCA量化重建残差）
-            content_pca:  [B,3,H,W]  # 二阶（PCA量化重建内容）
-            rgb_residual: [B,3,H,W]  # 一阶（RGB量化残差，推荐给ResNet）
+            residual_pca: [B,3,H,W]  BCPR residual (img minus reconstruction), used by MORD
+            content_pca:  [B,3,H,W]  reconstruction
+            rgb_residual: [B,3,H,W]  RGB quantization residual with step q (not used by MORD)
         """
         assert img.dim() == 4 and img.shape[1] == 3
         B, C, H, W = img.shape
         dtype = img.dtype
     
         # =========================
-        # (A) 一阶：RGB 像素域量化残差
+        # (A) RGB quantization residual
         # =========================
         img32 = img.to(torch.float32)
         rgb_q = torch.round(img32 / q) * q
         rgb_residual = (img32 - rgb_q).to(dtype)   # [B,3,H,W]
     
         # =========================
-        # (B) 二阶：PCA 分块量化重建残差（你原来的主体）
+        # (B) block-wise PCA quantization residual (BCPR)
         # =========================
     
         # -------- 1. unfold --------
@@ -246,13 +246,13 @@ class ResNet(nn.Module):
         idx = torch.argsort(eigvals, dim=1, descending=True)
         V = torch.gather(V, 2, idx.unsqueeze(1).expand(-1, 3, -1))
     
-        # 可选：量化 PCA 基（你的原逻辑）
+        # quantize the PCA basis with step q_v = 0.01
         V = torch.round(V / 0.01) * 0.01
     
-        # -------- 3. 投影 --------
+        # -------- 3. projection --------
         Z = torch.bmm(V.transpose(1, 2), Xc)  # [M,3,Npix]
     
-        # -------- 4. Z-space 归一化 + 量化（保持你原来的二阶定义）--------
+        # -------- 4. variance re-scaling (sigma, sigma') and coefficient quantization --------
         sigma = torch.tensor([0.08, 0.02, 0.01], device=Z.device, dtype=Z.dtype).view(1,3,1)
         sigma2 = torch.tensor([0.2, 0.05, 0.05], device=Z.device, dtype=Z.dtype).view(1,3,1)
     
@@ -260,7 +260,7 @@ class ResNet(nn.Module):
         Z_norm_q = torch.round(Z_norm / q) * q
         Zq = Z_norm_q * sigma / sigma2
     
-        # -------- 5. 重建 --------
+        # -------- 5. reconstruction --------
         Xq = torch.bmm(V, Zq) + mu
     
         Xq = Xq.view(B, Nblocks, 3, block * block).permute(0, 2, 3, 1)
@@ -274,7 +274,7 @@ class ResNet(nn.Module):
         return residual_pca, content_pca, rgb_residual
 
     def forward(self, x):
-        """Two-branch residual detector with confidence-based routing.
+        """Two-branch residual model with confidence-based routing.
 
         Returns a [B, 3] tensor:
             out[:, 0]  BCPR branch logit  (trainable -> updates BCPR encoder)
@@ -288,8 +288,8 @@ class ResNet(nn.Module):
         q = 0.006 * 4
 
         # ---- Branch 1: BCPR (PCA block quantization residual) -----------
-        NPR, _, _ = self.pca_block_round_residual_fast_accel_1stRGB_2ndPCA(x, q, block=4)
-        x1 = self.conv1(NPR * 3.464 / q)
+        res1, _, _ = self.pca_block_round_residual_fast_accel_1stRGB_2ndPCA(x, q, block=4)
+        x1 = self.conv1(res1 * 3.464 / q)
         x1 = self.relu(self.bn1(x1))
         x1 = self.maxpool(x1)
         x1 = self.layer1(x1)
@@ -298,8 +298,8 @@ class ResNet(nn.Module):
         out1 = self.fc1(x1)
 
         # ---- Branch 2: PiD (YUV pixel quantization residual) ------------
-        NPR2 = self.pid_residual_round(x, (0.004, 0.004, 0.004))
-        x2 = self.conv1_2(NPR2 * 3.464 / 0.004)
+        res2 = self.pid_residual_round(x, (0.004, 0.004, 0.004))
+        x2 = self.conv1_2(res2 * 3.464 / 0.004)
         x2 = self.relu(self.bn1_2(x2))
         x2 = self.maxpool(x2)
         x2 = self.layer1_2(x2)
